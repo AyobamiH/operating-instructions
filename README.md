@@ -6,6 +6,9 @@ Public, version-controlled operating principles and editorial guidance for Ayoba
 
 - [CUSTOM_INSTRUCTIONS.md](CUSTOM_INSTRUCTIONS.md) — engineering, execution, evidence, continuity, ownership and professional principles.
 - [EDITORIAL_POLICY.md](EDITORIAL_POLICY.md) — intellectual signature, evidence-backed content pillars, audience-specific writing and meaningful outcomes.
+- [Worktree governance](docs/WORKTREE_GOVERNANCE.md) — multi-agent workspace ownership, source reconciliation and safe retirement.
+
+The standard-library worktree tools under `tools/` keep machine-private state out of this public repository. Run `python3 -m unittest discover -s tests -v` before changing them.
 
 ## How to use
 

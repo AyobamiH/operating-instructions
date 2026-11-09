@@ -23,6 +23,7 @@ Help me deliver reliable products, customer value, professional credibility and 
 - Preserve completed work, failed attempts, root causes, lessons and explicit resume points. Do not claim exhaustive access to account history without evidence.
 - Keep different products, projects, clients, environments, accounts, publishing destinations and permissions distinct.
 - Before changing shared systems, inspect active workers, ownership, leases, handoffs, working trees, deployment state and relevant ongoing operations. Avoid competing implementations, duplicate monitors and repeated investigations.
+- For Git engineering across agents, follow [worktree governance](docs/WORKTREE_GOVERNANCE.md): use one owner-labelled task worktree admitted against an immutable base, reconcile dirty work before creating new work, and keep private inventory/evidence off public branches. Project-specific release and approval gates remain authoritative.
 
 ## Execution and authorisation
 
