@@ -44,6 +44,29 @@ python3 tools/agent_worktrees.py admit \
 
 On admission, a private lease records the source Git-common-dir, requested base and resolved commit, owner, task, branch and path. File-locking makes concurrent **cooperating users of this tool** serial. Other unmanaged shell commands can bypass it; this is not yet a universal Git filesystem permission boundary. Any agent bypassing the command is noncompliant and must be remediated at its own launcher/admission layer.
 
+### Preventing stale-worktree reuse
+
+An idempotent admission is refused when the existing leased tree is clean,
+its HEAD is behind the locally tracked origin/main, and its commit is already
+an ancestor of that main. That tree remains untouched; the owner must reconcile
+and admit a fresh task before writing new work. Dirty trees are preserved for
+explicit recovery rather than being automatically replaced.
+
+Run a **read-only** exact-upstream reconciliation after independently verifying
+GitHub's full main SHA and confirming local origin/main matches it:
+
+    python3 tools/agent_worktrees.py reconcile \
+      --repo poststeward-showcase=/path/to/allowlisted-showcase \
+      --upstream poststeward-showcase=<40-character verified GitHub main SHA>
+
+The private report records which trees are clean and upstream-integrated,
+which retain dirty work, and which require further branch review. A
+ready/owned lease is not a deletion instruction. Reconciliation never checks
+out source, mutates leases, removes worktrees or alters a running service.
+It fails closed when the supplied SHA and tracked main differ. The supplied
+SHA must first be checked against GitHub; local tracking refs alone are not
+proof of current upstream state.
+
 ## Safe handling of the legacy estate
 
 - The snapshot records Git registration (including prunable/missing), detached/branch, tracked staged/unstaged changes and normal-mode untracked entries. The untracked entry count may represent entire directories and is not an exhaustive file count.
