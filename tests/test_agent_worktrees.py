@@ -134,6 +134,76 @@ class WorktreeLedgerTests(unittest.TestCase):
             tool.admit(**{**kwargs, "trusted_roots": {"fixture": str(self.home)}})
         self.assertFalse((self.home / "managed").exists())
 
+    def test_integrated_clean_lease_cannot_be_reused_on_old_source(self):
+        kwargs = dict(
+            repo=self.repo, project="fixture", task="retired-task",
+            owner="agent-one", purpose="Completed fixture", base=self.base,
+            state=self.home / "state", workspace=self.home / "managed",
+            trusted_roots={"fixture": str(self.repo)},
+        )
+        entry = tool.admit(**kwargs)
+        (self.repo / "README.md").write_text("new main\n")
+        git(self.repo, "add", "README.md")
+        git(self.repo, "commit", "-m", "main advances")
+        now = git(self.repo, "rev-parse", "HEAD")
+        git(self.repo, "update-ref", "refs/remotes/origin/main", now)
+        with self.assertRaisesRegex(tool.AdmissionError, "upstream-integrated"):
+            tool.admit(**kwargs)
+        self.assertTrue(pathlib.Path(entry["path"]).is_dir())
+        self.assertEqual(json.loads(tool.owner_ledger(kwargs["state"], "fixture", "retired-task").read_text())["status"], "ready")
+
+    def test_dirty_owned_lease_preserves_unintegrated_work(self):
+        kwargs = dict(
+            repo=self.repo, project="fixture", task="unfinished-task",
+            owner="agent-one", purpose="Unfinished fixture", base=self.base,
+            state=self.home / "state", workspace=self.home / "managed",
+            trusted_roots={"fixture": str(self.repo)},
+        )
+        entry = tool.admit(**kwargs)
+        (self.repo / "README.md").write_text("new main\n")
+        git(self.repo, "add", "README.md")
+        git(self.repo, "commit", "-m", "main advances")
+        git(self.repo, "update-ref", "refs/remotes/origin/main", git(self.repo, "rev-parse", "HEAD"))
+        (pathlib.Path(entry["path"]) / "README.md").write_text("unique uncommitted work\n")
+        self.assertEqual(tool.admit(**kwargs)["path"], entry["path"])
+        self.assertEqual((pathlib.Path(entry["path"]) / "README.md").read_text(), "unique uncommitted work\n")
+
+    def test_reconcile_reports_merged_and_dirty_without_reaping(self):
+        state, workspace = self.home / "state", self.home / "managed"
+        kwargs = dict(repo=self.repo, project="fixture", task="merged-task",
+                      owner="agent-one", purpose="Tracked task", base=self.base,
+                      state=state, workspace=workspace,
+                      trusted_roots={"fixture": str(self.repo)})
+        ready = tool.admit(**kwargs)
+        dirty = self.home / "untracked-worktree"
+        git(self.repo, "worktree", "add", "-b", "uncommitted", str(dirty), self.base)
+        (dirty / "new.txt").write_text("unique evidence\n")
+        (self.repo / "README.md").write_text("new main\n")
+        git(self.repo, "add", "README.md")
+        git(self.repo, "commit", "-m", "new main")
+        now = git(self.repo, "rev-parse", "HEAD")
+        git(self.repo, "update-ref", "refs/remotes/origin/main", now)
+        report = tool.reconcile_upstreams([("fixture", self.repo)], {"fixture": now}, state)
+        group = report["repositories"][0]
+        self.assertEqual(group["errors"], [])
+        by_path = {row["path"]: row for row in group["worktrees"]}
+        self.assertEqual(by_path[str(self.repo)]["disposition"], "canonical-current")
+        self.assertEqual(by_path[ready["path"]]["disposition"], "upstream-integrated-needs-owner-retirement")
+        self.assertEqual(by_path[ready["path"]]["lease"]["owner"], "agent-one")
+        self.assertEqual(by_path[str(dirty)]["disposition"], "needs-review")
+        self.assertTrue((dirty / "new.txt").exists())
+        self.assertTrue(pathlib.Path(ready["path"]).exists())
+
+    def test_reconcile_does_not_assert_unverified_upstream(self):
+        now = git(self.repo, "rev-parse", "HEAD")
+        report = tool.reconcile_upstreams(
+            [("fixture", self.repo)], {"fixture": now}, self.home / "state"
+        )
+        group = report["repositories"][0]
+        self.assertTrue(group["errors"])
+        self.assertTrue(all(row["disposition"] == "unsafe/unknown"
+                            for row in group["worktrees"]))
+
     def test_bad_identifiers_and_duplicate_roots_fail_closed(self):
         with self.assertRaises(tool.AdmissionError):
             tool.verify_name("../unsafe")

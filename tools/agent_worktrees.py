@@ -135,6 +135,82 @@ def scan_roots(roots: list[tuple[str, pathlib.Path]], workers: int = 4) -> dict:
     return data
 
 
+def is_ancestor(repo: pathlib.Path, older: str, newer: str) -> bool:
+    """Read-only ancestry proof; never infer integration from a matching filename."""
+    proc = subprocess.run(
+        ["git", "-C", str(repo), "merge-base", "--is-ancestor", older, newer],
+        capture_output=True, text=True, timeout=15, check=False,
+    )
+    if proc.returncode not in (0, 1):
+        raise AdmissionError("Cannot establish commit ancestry: " + proc.stderr.strip()[:250])
+    return proc.returncode == 0
+
+
+def tracked_upstream(repo: pathlib.Path) -> str | None:
+    """Local tracking ref only: upstream freshness must be verified independently."""
+    proc = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--verify",
+         "refs/remotes/origin/main^{commit}"],
+        capture_output=True, text=True, timeout=15, check=False,
+    )
+    return proc.stdout.strip() if proc.returncode == 0 else None
+
+
+def reconcile_upstreams(
+    roots: list[tuple[str, pathlib.Path]], sha_by_label: dict[str, str],
+    state: pathlib.Path,
+) -> dict:
+    """Classify every registration; no worktree, branch or lease is changed."""
+    report = scan_roots(roots)
+    for group in report["repositories"]:
+        label, root = group["label"], pathlib.Path(group["root"])
+        expected = sha_by_label.get(label, "")
+        actual = tracked_upstream(root) if not group["errors"] else None
+        if not re.fullmatch(r"[0-9a-f]{40}", expected) or actual != expected:
+            group["errors"].append(
+                "Tracked main does not match supplied exact upstream; "
+                "verify GitHub and fetch before reconciliation."
+            )
+            for entry in group["worktrees"]:
+                entry["disposition"] = "unsafe/unknown"
+            continue
+        group["upstream_sha"] = expected
+        for entry in group["worktrees"]:
+            path = pathlib.Path(entry["path"])
+            if path == root:
+                entry["disposition"] = (
+                    "canonical-current" if entry["head"] == expected
+                    else "canonical-stale-checkout"
+                )
+                continue
+            manifest = owner_ledger(state, label, path.name)
+            if manifest.is_file():
+                try:
+                    lease = json.loads(manifest.read_text(encoding="utf-8"))
+                    if (lease.get("path") != str(path)
+                        or lease.get("repo_git_common_dir") != group["git_common_dir"]):
+                        raise ValueError("lease identity mismatch")
+                    entry["lease"] = {
+                        "status": lease.get("status"),
+                        "owner": lease.get("owner"),
+                        "task": lease.get("task"),
+                    }
+                except (OSError, ValueError, TypeError):
+                    entry["disposition"] = "unsafe/unknown"
+                    continue
+            if entry["status"] != "clean" or entry["locked"] or entry["prunable"]:
+                entry["disposition"] = (
+                    "needs-review" if entry["status"] == "dirty" else "unsafe/unknown"
+                )
+            elif entry["head"] == expected:
+                entry["disposition"] = "upstream-current"
+            elif is_ancestor(root, entry["head"], expected):
+                entry["disposition"] = "upstream-integrated-needs-owner-retirement"
+            else:
+                entry["disposition"] = "needs-integration-or-review"
+    return report
+
+
 def write_private_json(path: pathlib.Path, payload: dict) -> None:
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(path.parent, 0o700)
@@ -209,6 +285,18 @@ def admit(
             if not match:
                 raise AdmissionError("Existing lease does not match requested owner/base/purpose.")
             if path.is_dir() and common_dir(path) == root_gitdir:
+                # A clean, already-merged, behind-main lease must not become the
+                # starting point for another implementation by an old owner.
+                # This is an admission guard, not a file removal or lease revocation.
+                current = run_git(path, "rev-parse", "HEAD").strip()
+                upstream = tracked_upstream(repo)
+                if (upstream and current != upstream
+                        and status_entry({"worktree": str(path), "HEAD": current})["status"] == "clean"
+                        and is_ancestor(repo, current, upstream)):
+                    raise AdmissionError(
+                        "Existing clean lease is upstream-integrated and behind "
+                        "tracked main; reconcile/retire it, then admit a fresh task."
+                    )
                 previous["status"] = "ready"
                 write_private_json(manifest, previous)
                 return previous
@@ -257,6 +345,13 @@ def main() -> int:
     audit.add_argument("--repo", action="append", required=True, metavar="LABEL=PATH")
     audit.add_argument("--output", type=pathlib.Path)
     audit.add_argument("--workers", type=int, default=4)
+    review = subs.add_parser(
+        "reconcile",
+        help="Read-only, exact-upstream reconciliation; writes private disposition report.",
+    )
+    review.add_argument("--repo", action="append", required=True, metavar="LABEL=PATH")
+    review.add_argument("--upstream", action="append", required=True, metavar="LABEL=FULL_SHA")
+    review.add_argument("--output", type=pathlib.Path)
     create = subs.add_parser("admit", help="Reserve a bounded, owner-labelled worktree.")
     for arg in ("repo", "project", "task", "owner", "purpose", "base"):
         create.add_argument("--" + arg, required=True)
@@ -271,6 +366,33 @@ def main() -> int:
     )
     args = parser.parse_args()
     state = args.state_dir.expanduser()
+    if args.command == "reconcile":
+        roots, upstreams = [], {}
+        for item in args.repo:
+            if "=" not in item:
+                parser.error("--repo requires LABEL=PATH")
+            label, path = item.split("=", 1)
+            if not label or not path or label in [r[0] for r in roots]:
+                parser.error("missing or duplicate --repo label/path")
+            roots.append((label, pathlib.Path(path)))
+        for item in args.upstream:
+            if "=" not in item:
+                parser.error("--upstream requires LABEL=FULL_SHA")
+            label, sha = item.split("=", 1)
+            if label in upstreams or not re.fullmatch(r"[0-9a-f]{40}", sha):
+                parser.error("duplicate label or non-exact SHA")
+            upstreams[label] = sha
+        if set(upstreams) != {label for label, _ in roots}:
+            parser.error("each --repo needs exactly one --upstream")
+        report = reconcile_upstreams(roots, upstreams, state)
+        output = (args.output or state / "reconciliation-current.json").expanduser()
+        write_private_json(output, report)
+        for group in report["repositories"]:
+            counts = Counter(w["disposition"] for w in group["worktrees"])
+            print(json.dumps({"repo": group["label"], "dispositions": dict(counts),
+                              "errors": group["errors"]}, sort_keys=True))
+        print("LOCAL_PRIVATE_REPORT=" + str(output.resolve()))
+        return 2 if any(g["errors"] for g in report["repositories"]) else 0
     if args.command == "inventory":
         if not 1 <= args.workers <= 8:
             parser.error("--workers must be in range 1..8")
