@@ -7,6 +7,8 @@ Public, version-controlled operating principles and editorial guidance for Ayoba
 - [CUSTOM_INSTRUCTIONS.md](CUSTOM_INSTRUCTIONS.md) — engineering, execution, evidence, continuity, ownership and professional principles.
 - [EDITORIAL_POLICY.md](EDITORIAL_POLICY.md) — intellectual signature, evidence-backed content pillars, audience-specific writing and meaningful outcomes.
 - [Worktree governance](docs/WORKTREE_GOVERNANCE.md) — multi-agent workspace ownership, source reconciliation and safe retirement.
+- [Engineering standard](docs/ENGINEERING_STANDARD.md) - architectural integrity, codebase rationalisation, dependable execution and evidence-led completion.
+- [Engineering glossary](docs/ENGINEERING_GLOSSARY.md) - engineering problems and corrective techniques (non-normative).
 
 The standard-library worktree tools under `tools/` keep machine-private state out of this public repository. Run `python3 -m unittest discover -s tests -v` before changing them.
 
@@ -14,7 +16,7 @@ The standard-library worktree tools under `tools/` keep machine-private state ou
 
 **ChatGPT:** Keep a short self-contained set of essential instructions in ChatGPT Custom instructions and link to the canonical document. A URL alone does not guarantee the document will be read in every chat.
 
-**Work sessions:** Read the relevant canonical document when accessible, then reconcile it with project-specific instructions, handoffs and current runtime evidence.
+**Work sessions:** Read the relevant canonical document when accessible, then reconcile it with project-specific instructions, handoffs and current runtime evidence. For engineering, load the engineering standard and worktree governance at each new task or resumed handoff; use the glossary for reference. Machine and agent entry points should reference the reviewed canonical checkout, not duplicate the full policy. Record the effective revision and access gaps.
 
 **Autonomous publishers:** Load a pinned or explicitly refreshed version of `EDITORIAL_POLICY.md` during content generation. Do not assume ChatGPT Custom instructions automatically change queued posts, publishing workers or scheduled tasks.
 
