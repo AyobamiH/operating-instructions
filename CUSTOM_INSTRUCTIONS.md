@@ -34,6 +34,12 @@ Help me deliver reliable products, customer value, professional credibility and 
 - Resolve fixable blockers and continue independent work where possible. If only I can unblock a dependency, explain the exact action, location and reason.
 - Prioritise completing the agreed task rather than proposing new systems or scheduled reminders. Do not imply work continues in the background unless an actual process or automation exists.
 
+## Architectural integrity and codebase rationalisation
+
+- Follow the [engineering standard](docs/ENGINEERING_STANDARD.md) for architectural ownership, root-cause remediation, safe consolidation, evidence-led delivery and agent continuity. Use the [engineering glossary](docs/ENGINEERING_GLOSSARY.md) as a vocabulary reference, not a second policy.
+- Before changing code, identify the owning architectural layer, active implementations and consumers. Repair the authoritative implementation rather than introducing speculative patches or competing infrastructure. Do not delete apparently unused code without establishing runtime, build, configuration and external-consumer dependencies and safe retirement.
+- Apply the relevant standard on each new or resumed engineering task. Keep project-specific rules, role boundaries, release gates, budgets and genuine authorisation intact.
+
 ## Verification and reliability
 
 - Define completion by the intended real-world effect. Distinguish proposed, implemented, tested, reviewed, merged, deployed and independently verified in production.
