@@ -188,14 +188,22 @@ def reconcile_upstreams(
                 try:
                     lease = json.loads(manifest.read_text(encoding="utf-8"))
                     if (lease.get("path") != str(path)
-                        or lease.get("repo_git_common_dir") != group["git_common_dir"]):
-                        raise ValueError("lease identity mismatch")
+                        or lease.get("repo_git_common_dir") != group["git_common_dir"]
+                        or lease.get("branch") != (entry.get("branch") or "").removeprefix("refs/heads/")
+                        or lease.get("status") not in ("ready", "active")
+                        or type(lease.get("generation")) is not int
+                        or lease["generation"] < 1):
+                        raise ValueError("lease identity, branch, state or generation mismatch")
+                    verified_worktree_head(
+                        root, path, group["git_common_dir"], lease["branch"],
+                        entry["head"],
+                    )
                     entry["lease"] = {
                         "status": lease.get("status"),
                         "owner": lease.get("owner"),
                         "task": lease.get("task"),
                     }
-                except (OSError, ValueError, TypeError):
+                except (AdmissionError, OSError, ValueError, TypeError, subprocess.TimeoutExpired):
                     entry["disposition"] = "unsafe/unknown"
                     continue
             if entry["status"] != "clean" or entry["locked"] or entry["prunable"]:
@@ -223,6 +231,12 @@ def write_private_json(path: pathlib.Path, payload: dict) -> None:
             os.fsync(writer.fileno())
         os.chmod(tmp, 0o600)
         os.replace(tmp, path)
+        # Persist the directory entry as well as the file contents.
+        dirfd = os.open(path.parent, os.O_DIRECTORY)
+        try:
+            os.fsync(dirfd)
+        finally:
+            os.close(dirfd)
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)
@@ -250,12 +264,47 @@ def owner_ledger(state: pathlib.Path, project: str, task: str) -> pathlib.Path:
     return state / "leases" / project / (task + ".json")
 
 
+def verified_worktree_head(
+    repo: pathlib.Path, path: pathlib.Path, git_common: str,
+    branch: str, expected_head: str,
+) -> str:
+    """Fail closed on a changed Git registration, branch, or exact HEAD.
+
+    This is a cooperative admission check, NOT an OS-level writer fence.
+    """
+    if not re.fullmatch(r"[0-9a-f]{40,64}", expected_head):
+        raise AdmissionError("An exact expected worktree HEAD is required.")
+    if path.is_symlink() or not path.is_dir():
+        raise AdmissionError("Worktree is missing or is a symbolic link.")
+    registered = [
+        entry for entry in parse_worktrees(
+            run_git(repo, "worktree", "list", "--porcelain")
+        )
+        if pathlib.Path(entry["worktree"]).resolve() == path
+    ]
+    if len(registered) != 1:
+        raise AdmissionError("Worktree is not uniquely registered with the repository.")
+    entry = registered[0]
+    ref = "refs/heads/" + branch
+    if (entry.get("branch") != ref or entry.get("detached")
+            or entry.get("locked") or entry.get("prunable")):
+        raise AdmissionError("Registered worktree branch/state does not match its lease.")
+    if common_dir(path) != git_common:
+        raise AdmissionError("Worktree Git common-dir identity mismatch.")
+    symbolic = run_git(path, "symbolic-ref", "--quiet", "HEAD").strip()
+    current = run_git(path, "rev-parse", "--verify", "HEAD").strip()
+    if symbolic != ref or entry.get("HEAD") != current or current != expected_head:
+        raise AdmissionError("Worktree branch or HEAD has changed since verification.")
+    return current
+
+
 def admit(
     repo: pathlib.Path, project: str, task: str, owner: str, purpose: str,
     base: str, state: pathlib.Path, workspace: pathlib.Path,
     trusted_roots: dict[str, str],
+    expected_head: str | None = None, expected_generation: int | None = None,
 ) -> dict:
-    # The existing repos remain untouched; only a new managed worktree is created.
+    # New worktrees only; existing work remains owned by its original executor.
     project, task, owner = map(verify_name, (project, task, owner))
     if not purpose.strip() or len(purpose) > 250:
         raise AdmissionError("A bounded purpose (1-250 characters) is required.")
@@ -274,34 +323,56 @@ def admit(
         root_gitdir = common_dir(repo)
         base_sha = run_git(repo, "rev-parse", "--verify", base + "^{commit}").strip()
         if manifest.exists():
-            previous = json.loads(manifest.read_text(encoding="utf-8"))
+            try:
+                previous = json.loads(manifest.read_text(encoding="utf-8"))
+            except (ValueError, TypeError) as exc:
+                raise AdmissionError("Existing lease is malformed; recover it independently.") from exc
+            if not isinstance(previous, dict):
+                raise AdmissionError("Existing lease is not a record.")
+            # Never turn a released/revoked/recovery lease back into ready.
+            # Existing-owner re-entry requires an exact generation and HEAD.
             match = (
-                previous.get("owner") == owner
+                previous.get("schema_version") == SCHEMA
+                and previous.get("project") == project
+                and previous.get("task") == task
+                and previous.get("owner") == owner
+                and previous.get("source_root") == str(repo)
                 and previous.get("repo_git_common_dir") == root_gitdir
                 and previous.get("base_sha") == base_sha
+                and previous.get("branch") == "agent/" + task
                 and previous.get("path") == str(path)
                 and previous.get("purpose") == purpose
+                and previous.get("status") in ("ready", "active")
+                and type(previous.get("generation")) is int
+                and previous["generation"] >= 1
+                and previous["generation"] == expected_generation
             )
             if not match:
-                raise AdmissionError("Existing lease does not match requested owner/base/purpose.")
-            if path.is_dir() and common_dir(path) == root_gitdir:
-                # A clean, already-merged, behind-main lease must not become the
-                # starting point for another implementation by an old owner.
-                # This is an admission guard, not a file removal or lease revocation.
-                current = run_git(path, "rev-parse", "HEAD").strip()
-                upstream = tracked_upstream(repo)
-                if (upstream and current != upstream
-                        and status_entry({"worktree": str(path), "HEAD": current})["status"] == "clean"
-                        and is_ancestor(repo, current, upstream)):
-                    raise AdmissionError(
-                        "Existing clean lease is upstream-integrated and behind "
-                        "tracked main; reconcile/retire it, then admit a fresh task."
-                    )
-                previous["status"] = "ready"
-                write_private_json(manifest, previous)
-                return previous
-            # Do not silently recycle a missing worktree or an unknown directory.
-            raise AdmissionError("Existing lease has no valid worktree; requires manual recovery.")
+                raise AdmissionError(
+                    "Existing lease identity, state or generation mismatch; "
+                    "requires owner-led reconciliation."
+                )
+            if expected_head is None:
+                raise AdmissionError("Readmission requires --expected-head for the exact Git revision.")
+            current = verified_worktree_head(
+                repo, path, root_gitdir, previous["branch"], expected_head
+            )
+            if not is_ancestor(repo, base_sha, current):
+                raise AdmissionError("Worktree HEAD is outside the approved base lineage.")
+            upstream = tracked_upstream(repo)
+            if (upstream and current != upstream
+                    and status_entry({"worktree": str(path), "HEAD": current})["status"] == "clean"
+                    and is_ancestor(repo, current, upstream)):
+                raise AdmissionError(
+                    "Existing clean lease is upstream-integrated and behind "
+                    "tracked main; reconcile/retire it, then admit a fresh task."
+                )
+            # A successful readmission is read-only and preserves 'active'.
+            return previous
+        if expected_head is not None and expected_head != base_sha:
+            raise AdmissionError("New task expected HEAD must equal its exact base SHA.")
+        if expected_generation is not None and expected_generation != 1:
+            raise AdmissionError("New task generation must be one.")
         if path.exists() or path.is_symlink():
             raise AdmissionError("Unowned workspace destination already exists: " + str(path))
         branch = "agent/" + task
@@ -318,12 +389,14 @@ def admit(
             "source_root": str(repo), "repo_git_common_dir": root_gitdir,
             "branch": branch, "base_sha": base_sha, "base_requested": base,
             "created_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "generation": 1, "admitted_head": base_sha,
             "status": "reserved",
         }
         write_private_json(manifest, record)
         prefix.mkdir(mode=0o700, parents=True, exist_ok=True)
         try:
             run_git(repo, "worktree", "add", "-b", branch, str(path), base_sha, timeout=60)
+            verified_worktree_head(repo, path, root_gitdir, branch, base_sha)
             record["status"] = "ready"
         except Exception as exc:
             record["status"] = "requires_recovery"
@@ -355,6 +428,14 @@ def main() -> int:
     create = subs.add_parser("admit", help="Reserve a bounded, owner-labelled worktree.")
     for arg in ("repo", "project", "task", "owner", "purpose", "base"):
         create.add_argument("--" + arg, required=True)
+    create.add_argument(
+        "--expected-head",
+        help="Full expected Git HEAD, mandatory for existing-lease readmission.",
+    )
+    create.add_argument(
+        "--expected-generation", type=int,
+        help="Lease generation, mandatory for existing-lease readmission.",
+    )
     create.add_argument(
         "--workspace", type=pathlib.Path,
         default=pathlib.Path("~/.local/share/agent-worktrees"),
@@ -416,7 +497,7 @@ def main() -> int:
         result = admit(
             pathlib.Path(args.repo), args.project, args.task, args.owner,
             args.purpose, args.base, state, args.workspace,
-            host_config['projects'],
+            host_config['projects'], args.expected_head, args.expected_generation,
         )
     except (AdmissionError, OSError, subprocess.TimeoutExpired) as exc:
         print("ADMISSION_DENIED: " + str(exc), file=sys.stderr)

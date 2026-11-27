@@ -1,4 +1,5 @@
 """Regression tests for worktree inventory and safe owner-labelled admission."""
+import concurrent.futures
 import importlib.util
 import json
 import os
@@ -6,6 +7,7 @@ import pathlib
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -79,7 +81,8 @@ class WorktreeLedgerTests(unittest.TestCase):
         result = tool.admit(**kwargs)
         self.assertEqual(result["status"], "ready")
         self.assertEqual(result["branch"], "agent/issue-123")
-        self.assertEqual(result, tool.admit(**kwargs))
+        self.assertEqual(result, tool.admit(**kwargs, expected_head=self.base,
+                                           expected_generation=1))
         with self.assertRaises(tool.AdmissionError):
             tool.admit(**{**kwargs, "owner": "agent-two"})
         self.assertTrue((workspace / "fixture" / "issue-123").is_dir())
@@ -148,7 +151,7 @@ class WorktreeLedgerTests(unittest.TestCase):
         now = git(self.repo, "rev-parse", "HEAD")
         git(self.repo, "update-ref", "refs/remotes/origin/main", now)
         with self.assertRaisesRegex(tool.AdmissionError, "upstream-integrated"):
-            tool.admit(**kwargs)
+            tool.admit(**kwargs, expected_head=self.base, expected_generation=1)
         self.assertTrue(pathlib.Path(entry["path"]).is_dir())
         self.assertEqual(json.loads(tool.owner_ledger(kwargs["state"], "fixture", "retired-task").read_text())["status"], "ready")
 
@@ -165,7 +168,8 @@ class WorktreeLedgerTests(unittest.TestCase):
         git(self.repo, "commit", "-m", "main advances")
         git(self.repo, "update-ref", "refs/remotes/origin/main", git(self.repo, "rev-parse", "HEAD"))
         (pathlib.Path(entry["path"]) / "README.md").write_text("unique uncommitted work\n")
-        self.assertEqual(tool.admit(**kwargs)["path"], entry["path"])
+        self.assertEqual(tool.admit(**kwargs, expected_head=self.base,
+                                    expected_generation=1)["path"], entry["path"])
         self.assertEqual((pathlib.Path(entry["path"]) / "README.md").read_text(), "unique uncommitted work\n")
 
     def test_reconcile_reports_merged_and_dirty_without_reaping(self):
@@ -209,6 +213,156 @@ class WorktreeLedgerTests(unittest.TestCase):
             tool.verify_name("../unsafe")
         report = tool.scan_roots([("one", self.repo), ("two", self.repo)])
         self.assertIn("Duplicate Git common directory", report["repositories"][1]["errors"][0])
+
+    def _new_owned_tree(self):
+        args = dict(
+            repo=self.repo, project="fixture", task="issue-123",
+            owner="agent-one", purpose="Owner-fenced fixture", base=self.base,
+            state=self.home / "state", workspace=self.home / "managed",
+            trusted_roots={"fixture": str(self.repo)},
+        )
+        record = tool.admit(**args)
+        lease = tool.owner_ledger(args["state"], "fixture", "issue-123")
+        return args, pathlib.Path(record["path"]), lease
+
+    def test_wrong_branch_and_detached_head_refused_on_readmission(self):
+        args, path, lease = self._new_owned_tree()
+        original = lease.read_bytes()
+        git(path, "switch", "-c", "wrong-branch")
+        with self.assertRaisesRegex(tool.AdmissionError, "branch/state"):
+            tool.admit(**args, expected_head=self.base, expected_generation=1)
+        self.assertEqual(lease.read_bytes(), original)
+        git(path, "switch", "agent/issue-123")
+        git(path, "switch", "--detach", self.base)
+        with self.assertRaisesRegex(tool.AdmissionError, "branch/state"):
+            tool.admit(**args, expected_head=self.base, expected_generation=1)
+        self.assertEqual(lease.read_bytes(), original)
+
+    def test_readmission_requires_exact_revision_and_generation(self):
+        args, path, lease = self._new_owned_tree()
+        initial = lease.read_bytes()
+        with self.assertRaisesRegex(tool.AdmissionError, "generation"):
+            tool.admit(**args, expected_head=self.base)
+        with self.assertRaisesRegex(tool.AdmissionError, "expected-head"):
+            tool.admit(**args, expected_generation=1)
+        with self.assertRaisesRegex(tool.AdmissionError, "generation"):
+            tool.admit(**args, expected_head=self.base, expected_generation=2)
+        (path / "new.txt").write_text("new source\\n")
+        git(path, "add", "new.txt")
+        git(path, "commit", "-m", "fixture advance")
+        new_head = git(path, "rev-parse", "HEAD")
+        with self.assertRaisesRegex(tool.AdmissionError, "HEAD"):
+            tool.admit(**args, expected_head=self.base, expected_generation=1)
+        self.assertEqual(lease.read_bytes(), initial)
+        self.assertEqual(
+            tool.admit(**args, expected_head=new_head, expected_generation=1)["status"],
+            "ready",
+        )
+        self.assertEqual(lease.read_bytes(), initial)
+
+    def test_released_revoked_or_uncertain_leases_never_reactivate(self):
+        args, _, lease = self._new_owned_tree()
+        original = json.loads(lease.read_text())
+        for status in ("released", "revoked", "requires_recovery", "reserved", "unknown"):
+            updated = {**original, "status": status}
+            lease.write_text(json.dumps(updated))
+            prior = lease.read_bytes()
+            with self.assertRaisesRegex(tool.AdmissionError, "identity, state or generation"):
+                tool.admit(**args, expected_head=self.base, expected_generation=1)
+            self.assertEqual(lease.read_bytes(), prior)
+
+    def test_malformed_legacy_lease_fields_fail_closed_without_changes(self):
+        args, _, lease = self._new_owned_tree()
+        original = json.loads(lease.read_text())
+        for key in ("source_root", "repo_git_common_dir", "branch", "generation"):
+            incomplete = {k: v for k, v in original.items() if k != key}
+            lease.write_text(json.dumps(incomplete))
+            before = lease.read_bytes()
+            with self.assertRaises(tool.AdmissionError):
+                tool.admit(**args, expected_head=self.base, expected_generation=1)
+            self.assertEqual(lease.read_bytes(), before)
+        lease.write_text(json.dumps(original))
+
+    def test_readmission_preserves_active_status_without_rewriting(self):
+        args, _, lease = self._new_owned_tree()
+        active = json.loads(lease.read_text())
+        active["status"] = "active"
+        lease.write_text(json.dumps(active))
+        before = lease.read_bytes()
+        admitted = tool.admit(**args, expected_head=self.base, expected_generation=1)
+        self.assertEqual(admitted["status"], "active")
+        self.assertEqual(lease.read_bytes(), before)
+
+    def test_reconciliation_marks_wrong_branch_unsafe(self):
+        args, path, _ = self._new_owned_tree()
+        git(self.repo, "update-ref", "refs/remotes/origin/main", self.base)
+        git(path, "switch", "--detach", self.base)
+        report = tool.reconcile_upstreams(
+            [("fixture", self.repo)], {"fixture": self.base}, args["state"]
+        )
+        row = next(x for x in report["repositories"][0]["worktrees"]
+                   if x["path"] == str(path))
+        self.assertEqual(row["disposition"], "unsafe/unknown")
+
+    def test_interrupted_creation_is_recovery_only_not_readmitted(self):
+        from unittest import mock
+        args = dict(
+            repo=self.repo, project="fixture", task="issue-123",
+            owner="agent-one", purpose="Interrupted fixture", base=self.base,
+            state=self.home / "state", workspace=self.home / "managed",
+            trusted_roots={"fixture": str(self.repo)},
+        )
+        original_git = tool.run_git
+
+        def interrupted(repo, *cmd, **kwargs):
+            if cmd[:2] == ("worktree", "add"):
+                raise RuntimeError("simulated interruption")
+            return original_git(repo, *cmd, **kwargs)
+
+        with mock.patch.object(tool, "run_git", side_effect=interrupted):
+            with self.assertRaisesRegex(RuntimeError, "simulated interruption"):
+                tool.admit(**args)
+        lease = tool.owner_ledger(args["state"], "fixture", "issue-123")
+        self.assertEqual(json.loads(lease.read_text())["status"], "requires_recovery")
+        before = lease.read_bytes()
+        with self.assertRaises(tool.AdmissionError):
+            tool.admit(**args, expected_head=self.base, expected_generation=1)
+        self.assertEqual(lease.read_bytes(), before)
+
+    def test_concurrent_correct_readmissions_do_not_mutate_lease(self):
+        args, _, lease = self._new_owned_tree()
+        before = lease.read_bytes()
+
+        def readmit(_):
+            return tool.admit(**args, expected_head=self.base, expected_generation=1)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(readmit, range(2)))
+        self.assertEqual(results[0], results[1])
+        self.assertEqual(lease.read_bytes(), before)
+
+    def test_cli_readmission_requires_full_revision_and_generation(self):
+        args, _, lease = self._new_owned_tree()
+        cfg = self.home / "repos.json"
+        cfg.write_text(json.dumps({"projects": {"fixture": str(self.repo)}}))
+        base = [
+            sys.executable, str(MODULE_PATH), "--state-dir", str(args["state"]),
+            "admit", "--repo", str(args["repo"]), "--project", args["project"],
+            "--task", args["task"], "--owner", args["owner"],
+            "--purpose", args["purpose"], "--base", args["base"],
+            "--workspace", str(args["workspace"]), "--config", str(cfg),
+        ]
+        before = lease.read_bytes()
+        denied = subprocess.run(base, capture_output=True, text=True)
+        self.assertEqual(denied.returncode, 2)
+        self.assertIn("ADMISSION_DENIED", denied.stderr)
+        approved = subprocess.run(
+            [*base, "--expected-head", self.base, "--expected-generation", "1"],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(approved.returncode, 0, approved.stderr)
+        self.assertEqual(json.loads(approved.stdout)["owner"], "agent-one")
+        self.assertEqual(lease.read_bytes(), before)
 
 
 if __name__ == "__main__":

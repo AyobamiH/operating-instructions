@@ -46,11 +46,43 @@ On admission, a private lease records the source Git-common-dir, requested base 
 
 ### Preventing stale-worktree reuse
 
-An idempotent admission is refused when the existing leased tree is clean,
-its HEAD is behind the locally tracked origin/main, and its commit is already
-an ancestor of that main. That tree remains untouched; the owner must reconcile
-and admit a fresh task before writing new work. Dirty trees are preserved for
-explicit recovery rather than being automatically replaced.
+An existing-lease admission now requires the exact live Git HEAD and an explicit
+lease generation. The manager checks the original allowed repository, Git
+common directory, registered worktree, symbolic branch (rejecting detached
+HEAD), exact revision, base ancestry, lease owner, and admissible status while
+holding its normal project lock. It fails closed on missing legacy identity or
+generation and rejects released, revoked, reserved, and uncertain leases.
+Readmission returns the existing record without changing its status or
+rewriting its receipt.
+
+For an **existing** admitted task, first verify the current local Git HEAD
+against the authoritative repository/PR and read the private lease generation.
+Then repeat the ordinary `admit` command with these additional parameters:
+
+```bash
+  --expected-head <verified-exact-full-HEAD> \
+  --expected-generation <recorded-generation>
+```
+
+New task admissions retain the exact immutable base requirement and initialise
+generation 1. Malformed legacy records require owner-led reconciliation; do not
+repair lease identities by guessing from worktree directory names. A clean
+already-integrated branch still cannot be reused on stale main. Dirty or
+unmerged work remains preserved for explicit recovery.
+
+**Security limit:** these checks control only **cooperating callers of the
+manager**. They do not authenticate the operating-system identity of an
+arbitrary user-supplied owner label or revoke filesystem/commit/push access
+from another unrestricted process under the same host UID. This source-only
+hardening does not implement a live ownership-transfer command or establish
+safe old-writer fencing. Any cross-owner handoff must remain blocked until
+the actual execution launcher/broker has independently authenticated actor
+identities, exclusive write permissions or equivalent enforced revocation,
+generation-aware admission, durable compare-and-swap transition receipts,
+crash recovery and successful real-boundary tests. A signed GitHub issue,
+changed JSON owner label, stopped PID, Git hook, or unchecked caller-supplied
+fence token cannot substitute for this guarantee. Never transfer an active
+product worktree using only these source checks.
 
 Run a **read-only** exact-upstream reconciliation after independently verifying
 GitHub's full main SHA and confirming local origin/main matches it:
